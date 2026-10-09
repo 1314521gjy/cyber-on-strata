@@ -1,0 +1,35 @@
+# build products
+build/
+build-*/
+*.obj
+*.lib
+*.pdb
+*.exp
+CMakeCache.txt
+CMakeFiles/
+
+# local scratch / logs
+_backups/
+_staging/
+logs/
+*.log
+out-*.txt
+*.DONE
+
+# model weights and derived artifacts (never commit these)
+/models/
+/packs/
+/profiles/
+/expert-profile-*.bin
+/iq-native/
+
+# editor / OS
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# python caches
+__pycache__/
+*.pyc
