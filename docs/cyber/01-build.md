@@ -63,6 +63,29 @@ mmq plan: any=1 fallback=1 layers=40 gu_type=12 d_type=13 supported(gu)=1 suppor
 
 `gu_type=12` = Q4_K、`d_type=13` = Q5_K，两个 `supported(...)=1` 才是"核在场且被选上"。
 
+> **一条来自内测用户的更正（2026-10-10）**：Linux 侧流传的配方里写"Q4_K 专家必须同时开
+> `-DSTRATA_MMQ_KQUANTS=ON -DSTRATA_ORCA_Q4KS_MMQ=ON`"。**后半句不需要**：`STRATA_ORCA_Q4KS_MMQ` 是
+> "Build the GGML Q5_0 MMQ instance for **OrcaRouter Q4_K_S**"（上游另一个模型），与本 pack 无关 ——
+> 本项目发布的引擎就是在它 **OFF** 的情况下构建的（`build/CMakeCache.txt`：`STRATA_MMQ_KQUANTS:BOOL=ON` /
+> `STRATA_ORCA_Q4KS_MMQ:BOOL=OFF`），`mmq plan` 自证行与上面逐字一致。开了无害，但不必要。
+
+### 2.2b Linux 侧怎么建（内测用户实测走通的路，**不要编上游**）
+
+- ⚠️ **上游 `Niko1221/Strata` 主线目前不支持本模型**：它在 `--native` 下**硬拒 `--no-ple`**（三处 gate），
+  且只读 `qwen4exp.*` 元数据键、**不认 `qwen35moe.*`** ⇒ 几何退回 125B 形状 ⇒
+  `native experts: expert geometry is not whole blocks`（2048 % 640 ≠ 0）。上游 issue #1402 仍开着。
+  ⇒ **只能从本 fork 构建**：`https://github.com/1314521gjy/cyber-on-strata`。
+- **发布的 `strata.exe` 在 Wine 下跑不了**：Ubuntu 的 NVIDIA 驱动不提供 `nvcuda.dll`（那是 WSL 的东西），
+  Wine 直接 `import_dll Library cublas64_13.dll not found` ⇒ Linux 必须自编译。
+- **分词器**：`llama-tokenize.exe` 在 Wine 下可用（纯 CPU）；更干净是自编 fork 里 pin 的
+  `third_party/llama.cpp`（`-DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_COMMON=ON -DLLAMA_CURL=OFF -DLLAMA_CUDA=OFF`
+  ⇒ `--target llama-tokenize`，CPU-only 约 1 分钟）。内测用户已与包内 exe **逐字节对照同一中文提示的 `--ids`，
+  输出完全相同**（`diff` 为空）。
+- **本 fork 基座（0.1.39）没有 `--gpu` 旗标**（上游 0.1.41 才有）⇒ 多卡机选卡用
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=N`。
+- **传递方式**：**发 zip/tar，不要散文件**。有内测用户收到的包里路径被压平成
+  `cyber-strata-beta-20261010\engine\strata.exe` 这种**含反斜杠的单文件名**，必须手工按 `\` 重建目录树。
+
 ### 2.3 `STRATA_BUILD_TESTS=ON`
 
 `CMakeLists.txt` 的 `option(STRATA_BUILD_TESTS ...)` 分支会额外带上：CUDA prompt-attention parity、
