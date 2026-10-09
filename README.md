@@ -181,6 +181,7 @@ cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=75;86;89;120 -DSTRATA_MMQ_KQUANTS
 | [`07-shipping-params.md`](docs/cyber/07-shipping-params.md) | 发布参数与调优指引 |
 | [`08-known-issues.md`](docs/cyber/08-known-issues.md) | 已知限制与未验清单 |
 | [`09-fork-changelog.md`](docs/cyber/09-fork-changelog.md) | 本 fork 相对上游的全部改动 |
+| [`10-serving.md`](docs/cyber/10-serving.md) | 把它做成服务：OpenAI 兼容端点、与上游 serve 层的差异、DSH 接线 |
 
 ---
 

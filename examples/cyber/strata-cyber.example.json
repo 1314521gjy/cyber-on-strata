@@ -1,0 +1,42 @@
+{
+    "exe":  "E:\\strata-v0139\\build\\strata.exe",
+    "args":  [
+                 "--pack",
+                 "E:\\strata-models\\Cyber\\iq-native",
+                 "--native",
+                 "E:\\llama-models\\Cyber-Tiel-Coder-35B-A3B\\Cyber-Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL.gguf",
+                 "--no-ple",
+                 "--expert-profile",
+                 "E:\\strata-models\\Cyber\\expert-profile-40x256-trace-cur.bin",
+                 "--expert-cache",
+                 "auto",
+                 "--vram-reserve-mib",
+                 "1500",
+                 "--prefill",
+                 "2048",
+                 "--max-context",
+                 "32768",
+                 "--kv",
+                 "int8",
+                 "--kv-resident",
+                 "20480",
+                 "--spec",
+                 "2",
+                 "--suffix-draft",
+                 "0",
+                 "--mtp-max-t",
+                 "1",
+                 "--pool-workers",
+                 "0"
+             ],
+    "cwd":  "E:\\strata-v0139",
+    "tokenizer":  "E:\\strata-models\\Cyber\\iq-native\\tokenizer",
+    "model_name":  "cyber-tiel-coder-35b-a3b",
+    "log":  "E:\\strata-models\\Cyber\\logs\\strata-cyber-serve.log",
+    "lib_dirs":  [
+                     "E:\\cuda-13.3\\bin\\x64"
+                 ],
+    "port":  8091,
+    "reasoning_budget_tokens":  0,
+    "anthropic_thinking":  "model"
+}

@@ -4671,9 +4671,15 @@ int main(int argc, char** argv) {
 #endif
     }
     if (o.serve) {
-        if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 ||
+        // 2026-10-09: the --spec >= 2 and --mtp DIR requirements are relaxed.  They exist because the
+        // reference model needs the canonical MTP draft layer; a model that carries its own MTP head
+        // without a compatible runtime directory cannot use it (Cyber-Tiel-Coder-35B-A3B: its draft
+        // block has no hyper-connection tensors, so the drafter fused GR read faults).  Without --mtp
+        // the serve path behaves like the CLI without a drafter: the verify windows stay, the drafts
+        // do not, and every mtp.* touch below is skipped.
+        if (o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
-            std::fprintf(stderr, "strata serve: needs --spec T, --mtp DIR and --prefill CHUNK (and a fillable "
+            std::fprintf(stderr, "strata serve: needs --prefill CHUNK (and a fillable "
                                  "--expert-cache; the graphed hit path additionally needs --expert-profile P)\n");
             return 2;
         }
@@ -5198,7 +5204,7 @@ int main(int argc, char** argv) {
         }
         ver.set_remote_expert_opt(remote_opt.get());
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, o.batch), err) ||
-            !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err)) {
+            (!o.mtp.empty() && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
@@ -5264,8 +5270,8 @@ int main(int argc, char** argv) {
             const size_t n_st = stages.size();
             // the draft layer's K/V lives on the last stage's GPU (the drafter is loaded there): with a split it is
             // saved with that stage's image, under its device; stage 0's image holds none
-            const strata::core::QsaState* draft0 = n_st > 0 ? nullptr : &mtp.kv_state();
-            auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return k + 1 == n_st ? &mtp.kv_state() : nullptr; };
+            const strata::core::QsaState* draft0 = (n_st > 0 || o.mtp.empty()) ? nullptr : &mtp.kv_state();
+            auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return (o.mtp.empty() || k + 1 != n_st) ? nullptr : &mtp.kv_state(); };
             strata::core::ConversationCheckpointSplit cs;
             if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);
             struct MergeBack {
@@ -5448,11 +5454,11 @@ int main(int argc, char** argv) {
             // by the draft slot at speculative.cpp:1624-1625).  See the ledger.
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
             // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
-            const bool batched = !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
-            if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+            const bool batched = !o.mtp.empty() && !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
+            if (!e.empty() || (!o.mtp.empty() && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
             if (std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
                 std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
-                             batched ? "batched" : "token", mtp.kv_state().kv_mode, (long long) T);
+                             batched ? "batched" : "token", o.mtp.empty() ? -1 : mtp.kv_state().kv_mode, (long long) T);
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
             pp_reached = done;
@@ -7339,7 +7345,10 @@ int main(int argc, char** argv) {
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
-                const bool drafted = eos || produced_n >= max_new ||
+                // 2026-10-09: with no --mtp there is no drafter to call (see the serve entry guard): the
+                // window still runs, it just has no drafts - the CLI's use_mtp == false path does the same.
+                // A draft is verified against the target model, so an empty draft set costs speed, not output.
+                const bool drafted = eos || produced_n >= max_new || o.mtp.empty() ||
                                      mtp.draft(T, window.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
                     const Clock::time_point tw3 = Clock::now();

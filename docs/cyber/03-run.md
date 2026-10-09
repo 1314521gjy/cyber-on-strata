@@ -34,7 +34,8 @@ strata.exe ^
   --prefill 2048 ^
   --max-context 4096 ^
   --max-new 512 ^
-  --kv k8v4 ^
+  --kv int8 ^
+  --kv-resident 20480 ^
   --spec 2 --suffix-draft 0 --mtp-max-t 1 ^
   --pool-workers 6 --pool-affinity all ^
   --stats
@@ -59,8 +60,8 @@ strata.exe ^
 | **`--vram-reserve-mib N`** | **从专家缓存里扣掉、留给 KV / 激活 / 桌面的显存**（`缓存 = free − reserve`） | 🔴 **唯一必须按卡改的参数**。判据线是引擎自己打印的那一行：`expert cache auto: X GiB free, Y MiB reserved -> N slots`。先把 reserve 设小，看它报多少槽，再往上加直到留够 KV | 24568（**故意的限流值，8 GB 卡绝不能用**） |
 | `--expert-cache auto` | 按 `free − reserve` 自动定槽数 | 发货一律 `auto`（写死槽数只用于实验） | auto |
 | `--max-context N` | KV 容量。4k 时 KV ≈ 100 MB 级（可忽略）；越长越吃显存 | 8 GB 卡 ≤8192 起步；要长上下文就配 `--kv` 压位宽 | 4096 |
-| `--kv fp16\|int8\|q4_0\|k8v4` | KV 位宽 | 显存紧就 `int8`；极端紧就 `k8v4`（有精度代价，**未测** ⇒ `D`） | `k8v4` |
-| `--kv-resident N` | KV 流式：每层只留 N 格在显存（下限 **20480**），整份 K/V 放**钉住的宿主内存** | 长上下文时用；**与 `--kv k8v4` / `q4_0` 不能同用**（引擎拒绝） | 0（未用） |
+| `--kv fp16\|int8\|q4_0\|k8v4` | KV 位宽 | 显存紧就 `int8`；极端紧就 `k8v4` / `q4_0`（有精度代价，见 `06-memory-budget.md` §5） | **`int8`** |
+| `--kv-resident N` | KV 流式：每层只留 N 格在显存（下限 **20480**），整份 K/V 放**钉住的宿主内存** | 长上下文时用，实测 128k 可腾约 2.1 GiB 显存（`06-memory-budget.md` §5.2）；**与 `--kv k8v4` 不能同用**（引擎拒绝；`q4_0` 实测可同用） | **20480** |
 | `--prefill CHUNK` | 预填分块；`auto` = 能借多少缓存借多少（上限 8192） | 富余用 `auto`；紧就用 2048 | 2048 |
 
 ### 2.3 计算与调度
