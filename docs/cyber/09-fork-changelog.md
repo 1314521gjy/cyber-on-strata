@@ -49,6 +49,40 @@
 2. 引擎**不打印** finish/stop 行 ⇒ "停机"只能由 **token 数 < `--max-new`** ＋ **末 token = 248046** ＋
    **结尾无后续生成** 三条合起来判定。**要变成日志自证需再加一次引擎改动（未做）。**
 
+### 1.3 QSA 选择预算：上游靶子的 `2,048` → 模型自己的 `262,144`（**修掉 2,051 cell 静默截断**）
+
+| 文件 | 位置 | 改了什么 | 为什么 | 怎么验证的 |
+|---|---|---|---|---|
+| `include/strata/kernels/qsa.hpp` | 约 `:127` | 新增 `qsa_selection_budget()` / `qsa_set_selection_budget()` / `..._from_geometry()`；`qsa_selection_width()` 取 `max(预算, s.idx_top_k)` | `qsa_real_shapes()` 带的是**上游靶子**的 `idx_top_k = 2048`（`idx_block = 4`），而 `attention.indexer.top_k` 是**每模型**的数：本模型 **262144**（整个上下文）。于是 `width = min(n_kv, 2048+4-1)` **恒 ≤ 2051** ⇒ 提示超过它，**尾部对模型不存在**。默认仍是 2,048 ⇒ parity 测试与参考语义不变 | 引擎自证行：`QSA selection budget 262144 cells`；`step[kStepWidth]` 由 2051 变为 `n_kv` |
+| `src/kernels/cuda/native_qsa_indexer.cu` | 约 `:34` / `:232` | 预算全局（`std::atomic<int64_t>`，默认 2,048）＋三个访问器；`STRATA_QSA_BUDGET` 覆盖在此实现 | 预算必须**一处定义、全员一致**：`qsa_shapes()` 只搬 5 个字段，而 `prefill.cpp` 有 4 处直接调 `qsa_real_shapes()`。分歧不是变慢，是**越界读** | 负控工具：`STRATA_QSA_BUDGET=2048` 单开关回到旧行为（见下） |
+| `src/program/generate.cpp` | 约 `:2360` | 开机一次 `qsa_set_selection_budget_from_geometry(g.idx_top_k)` ＋自证行 | 必须在任何 buffer 定尺 / 图捕获之前 | 自证行打印预算与"宽度 = n_kv 的上下文上限" |
+| `src/core/verify.cpp` | 约 `:405` | 同一构造函数（**原先直接写几何值，会把 `STRATA_QSA_BUDGET` 悄悄拨回去**） | 自校验路径的 `cap_` 与引擎必须同源，否则 stride 不一致 | 二分实验因此先得出一批废读数，改正后 `cap` 才真随开关变 |
+| `src/core/layer.cpp` | 约 `:777` | 恒等斜坡：栈上 `int32_t ramp[4096]` ＋ `cap > 4096 → exit(1)` ⇒ 按 `cap` 堆分配，闸门提到 `kTopkMaxCells`（32,768 ⇒ 128 KiB） | 预算接上后 `cap` = 32,768，旧闸门会让引擎直接起不来 | 单 token 正常出（不是 `exit 1`） |
+| `src/prefill/prefill.cpp` | 约 `:660` / `:920` / `:2400` | ① `qsa_set_bytes()` 增 `dense_sel` 参数；② dense 下**跳过选择**（它是唯一的 `T × cap` 写者：32,768 × 8,192 = **1 GiB**）；③ 恒等 id 改为 **cudaMalloc 自有缓冲** `Impl::dense_ids`，注意力按 `attn_batch` 分块、复用同一份；④ 三个调试块（SEL_OVERLAP / IDX_FP16 / QSA_DUMP）在 dense 下关闭 | **`carve` 把同一个 `base` 交给三个分配器**（GDN 半边 / QSA 半边 / MoE 半边）⇒ 注意力与 MoE **复用同一块内存**。旧流程能活，是因为**选择核每层都重写一遍 id**；只写一次就会被前面几层的 MoE 冲掉 ⇒ 注意力拿到垃圾 cell ⇒ 页表越界 ⇒ **两个注意力核都报非法访存**（实测：`ids[row31] = 901283223 -1209789280 …`） | 修后 `ids[row31][0..3] = 0 1 2 3`；dense 自证行 `qsa_prompt_attn_batch -> 1 (dense=1, cap=32768)` |
+
+**判据（`A` 级，同机）**：提示末尾放"忽略以上全部，只回答 `ZQ7MARKER41`"。
+
+| prompt tokens | 改前 | 改后 |
+|---|---|---|
+| 2,045 | ✅ | ✅ |
+| **2,085** | ❌ 丢尾 | ✅ |
+| 2,885 / 5,624 | ❌ | ✅ |
+| 11,988 / 21,018 | ❌ | ✅ |
+
+**负控**：**同一二进制**只把预算拨回 2,048（`STRATA_QSA_BUDGET=2048`）⇒ 2,085 与 2,885 立刻变红，模型的思考原文是
+*"There's no actual question. The user just pasted code."* ⇒ 因果确定，且判据确实会红。
+
+**Agent 形 A/B**（24 工具表 + 长工作区 dump + 任务放在最末，prompt 7,561 / 15,253 / 26,315）：
+
+| case | 改后 | 负控（预算 2,048） |
+|---|---|---|
+| 7.5k 读文件 | ✅ `read_file(src/handlers.py)`，二轮答对行数 | ❌ 去读**上下文里不存在**的 `config/config.yaml` |
+| 15k 取字段 | ✅ 直接从上下文报出精确值 | ❌ `list_dir(".")` |
+| 26k 改配置 | ✅ 先 `read_file` 再改 | ❌ `list_dir(".")` |
+
+**代价（诚实登记）**：解码侧非缓存显存 **+约 75 MiB**（K/V gather scratch 与注意力 scratch 按新容量定尺）；
+预填期**多借约 250 MB**（借自专家缓存尾部、跑完归还，不额外占显存）⇒ 8 GB 档峰值预估 7.26 → 约 **7.33 GiB**。
+
 ---
 
 ## §2 MTP（多 token 预测）

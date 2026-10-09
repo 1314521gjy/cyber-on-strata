@@ -18,9 +18,11 @@
     -Workers <N>        --pool-workers (default 0 = auto)
     -Affinity <mode>    all | auto | p-cores (default auto)
     -Kv <mode>          fp16 | int8 | k8v4 | q4_0  (default int8 = k8v8)
-    -KvResident <N>     keep N KV cells per layer in VRAM, park the rest in pinned RAM
-                        (default 20480; 0 = off). Frees VRAM at long context.
-                        Works with int8 / q4_0 / fp16; k8v4 is refused by the engine.
+    -KvResident <N>     DO NOT USE. Keep it at 0 (the default). N > 0 parks all but the last N KV
+                        cells of each layer in pinned RAM; the engine then MASKS the cells it did
+                        not make resident, so attention sees only a window - and at 20480 it also
+                        stalls the prompt READ (a 21k prompt read 18432 tokens and generated 0).
+                        Measured 2026-10-10; the launcher's 20480 default was wrong before v2.
     -Chat               wrap the prompt in the model's chat markers (EXPERIMENTAL)
     -ShowLog            also print the whole engine log
 #>
@@ -35,7 +37,7 @@ param(
   [int]$Workers = 0,
   [string]$Affinity = "auto",
   [string]$Kv = "int8",
-  [int]$KvResident = 20480,
+  [int]$KvResident = 0,
   [switch]$Chat,
   [switch]$ShowLog
 )
@@ -52,6 +54,47 @@ $profD = Join-Path $root 'profile'
 
 foreach ($p in @($exe, $tok, $tab, $pack)) {
   if (-not (Test-Path -LiteralPath $p)) { Die "package file missing: $p" }
+}
+
+# ---- what card is this? (a SUGGESTION only; it never overrides -Reserve) -------------------
+# The defaults in this package are the 8 GB tier, so a small card needs no changes.  A bigger card
+# should LOWER -Reserve (the cache is sized `free - reserve`), so print the card's tier up front.
+function SuggestedReserve([int]$mib) {
+  if ($mib -le 0)     { return 1500 }   # unknown -> the shipped 8 GB default
+  if ($mib -le 9000)  { return 1500 }   # 8 GB
+  if ($mib -le 13000) { return 2500 }   # 10-12 GB
+  if ($mib -le 18000) { return 3500 }   # 16 GB
+  if ($mib -le 26000) { return 5000 }   # 24 GB
+  return 1500                           # 32 GB and up: 1500 already lets the cache hold all 10240
+                                        # experts (measured) -- a bigger reserve only takes VRAM
+                                        # away from the KV and the desktop
+}
+$gpuName = ""; $gpuMib = 0
+try {
+  $q = & nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>$null
+  if ($q) {
+    $f = (@($q)[0] -split ',')
+    if ($f.Count -ge 2) { $gpuName = $f[0].Trim(); [void][int]::TryParse($f[1].Trim(), [ref]$gpuMib) }
+  }
+} catch { }
+if (-not $gpuName) {
+  try {
+    $vc = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object { $_.Name -match 'NVIDIA|Radeon|Arc' })
+    if ($vc.Count -gt 0) {
+      $gpuName = $vc[0].Name
+      if ($vc[0].AdapterRAM -gt 0 -and $vc[0].AdapterRAM -lt 4000000000) { $gpuMib = [int]($vc[0].AdapterRAM / 1MB) }
+    }
+  } catch { }
+}
+if ($gpuName) {
+  $sug = SuggestedReserve $gpuMib
+  $shown = if ($gpuMib -gt 0) { "$gpuName ($gpuMib MiB)" } else { $gpuName }
+  Write-Host ("      GPU: " + $shown) -ForegroundColor DarkGray
+  if ($sug -ne $Reserve) {
+    Write-Host ("      note: for this card -Reserve " + $sug + " would give a bigger expert cache " +
+                "(you asked for " + $Reserve + ").  It is the ONLY knob that must match the card -- " +
+                "see section 4 of the shipping doc.") -ForegroundColor Yellow
+  }
 }
 
 # ---- model -------------------------------------------------------------
@@ -192,3 +235,10 @@ Write-Host ("log     : " + $logPath)
 if ($ShowLog) { Write-Host ""; $log | ForEach-Object { Write-Host "  $_" } }
 Write-Host ""
 Write-Host "Please report: GPU model + VRAM, system RAM, and the cache / hits / decode lines above."
+Write-Host ""
+Write-Host "Tuning (the package default is the 8 GB tier -- change these ONLY on a bigger card):" -ForegroundColor DarkGray
+Write-Host "  -Reserve   8 GB 1500 | 12 GB 2500 | 16 GB 3500 | 24 GB 5000 | 32 GB 1500 (= every expert resident)" -ForegroundColor DarkGray
+Write-Host "  -Context   8 GB 4096 | 12 GB 8192 | 16 GB 16384 | 24 GB+ 32768" -ForegroundColor DarkGray
+Write-Host "  -Prefill   8 GB 2048 | 12 GB 4096 | 16 GB+ 8192   (it borrows expert-cache slots while the prompt runs)" -ForegroundColor DarkGray
+Write-Host "  watch the engine's own line: expert cache auto: X GiB free, Y MiB reserved -> N slots" -ForegroundColor DarkGray
+Write-Host "  keep -KvResident at 0: a nonzero value makes the engine DROP context it did not keep resident." -ForegroundColor DarkGray

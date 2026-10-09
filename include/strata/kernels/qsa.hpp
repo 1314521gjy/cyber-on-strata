@@ -130,8 +130,31 @@ inline double qsa_freq_base() { return 1e7; }
 /// not fill one.  So the plan's "selection skipped when context <= 2,048" is conservative by two - the source's
 /// own bound is 2,051, and `ref/qsa.py` L292-294 records the disagreement.  Below the bound the selection is
 /// the IDENTITY, which `topk_512` is required to reproduce exactly rather than approximately.
+///
+/// **THE BUDGET IS THE MODEL'S, NOT THE UPSTREAM TARGET'S.  ADAPTED 2026-10-10 for Cyber-Tiel-Coder-35B-A3B.**
+/// `QsaShapes::idx_top_k` is `qsa_real_shapes()`'s Flash-Next 2,048, but `attention.indexer.top_k` is a
+/// PER-MODEL number: Whittle-Next - which is this target - declares 262,144, the whole context, so nothing is
+/// ever pruned, and `attention.compress_ratios` 0 on all 40 layers, which the reference reads as DENSE
+/// (`strata/core/layout.hpp:60-69`; `third_party/llama.cpp/src/models/qwen4exp.cpp:786` gates its ENTIRE QSA
+/// path on `compress_ratios[il] > 0`).  Leaving 2,048 in this formula silently truncated attention to its
+/// first 2,051 cells - MEASURED: a tail instruction at 2,048 prompt tokens is honoured, at 2,066 it is not,
+/// while llama.cpp honours the same instruction at 12,812 (both A-grade, same machine, same batch).
+///
+/// `qsa_set_selection_budget` is therefore the ONE writer, called once at startup from the model geometry
+/// (`generate.cpp`, next to `native_qsa_indexer_set_enabled`; and `verify.cpp`).  It is a process-global rather
+/// than a shape field because EVERY caller of this function must agree: `qsa_shapes()` (`layer.cpp:507`) and
+/// the `qsa_real_shapes()` call sites (`prefill.cpp:901/1074/1423/1595`) do not carry the field today, and a
+/// divergence here is an out-of-bounds read in the attention kernels, not a slowdown
+/// (`native_qsa_score.cu:60` spells out the same 2,051 bound on the device side).
+int64_t qsa_selection_budget();
+void qsa_set_selection_budget(int64_t top_k);
+/// The ONE way an entry point publishes the model's budget: `geometry_top_k` is `ModelGeometry::idx_top_k`
+/// (`layout.hpp:62`), and `STRATA_QSA_BUDGET` overrides it for a bisection arm (an override has to be the last
+/// word in EVERY caller - `verify.cpp` runs after `generate.cpp` and used to put the geometry's value back).
+void qsa_set_selection_budget_from_geometry(int64_t geometry_top_k);
 inline int64_t qsa_selection_width(int64_t n_kv, const QsaShapes& s) {
-    const int64_t w = s.idx_top_k + s.idx_block - 1;
+    const int64_t budget = qsa_selection_budget() > s.idx_top_k ? qsa_selection_budget() : s.idx_top_k;
+    const int64_t w = budget + s.idx_block - 1;
     return n_kv < w ? n_kv : w;
 }
 

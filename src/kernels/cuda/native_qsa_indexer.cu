@@ -26,12 +26,20 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
 namespace strata::kernels {
 namespace {
 std::atomic<bool> enabled{false};
+// THE SELECTION BUDGET (`strata/kernels/qsa.hpp:qsa_selection_width`): the model's `attention.indexer.top_k`,
+// one writer at startup from the geometry.  Default 2,048 = the shape default `qsa_real_shapes()` carries, so a
+// caller that never sets it sees exactly the pre-2026-10-10 behaviour (the parity tests are such callers and
+// must keep comparing against the reference's 2,051-cell bound).  Whittle-Next/Cyber sets 262,144 through
+// `qsa_set_selection_budget`, which is what makes `width == n_kv` and turns the truncation off.
+std::atomic<int64_t> selection_budget{2048};
 constexpr int D = 128, R = 4, ROT = 64, THREADS = 256;
 __device__ float warp_sum(float x) {
 #pragma unroll
@@ -225,6 +233,22 @@ bool overlaps(Span a, Span b) {
 
 void native_qsa_indexer_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_qsa_indexer_enabled() { return enabled.load(std::memory_order_relaxed); }
+// `strata/kernels/qsa.hpp:qsa_selection_width`: set once at startup, before any buffer is sized or captured.
+void qsa_set_selection_budget(int64_t top_k) {
+    selection_budget.store(top_k > 0 ? top_k : 1, std::memory_order_relaxed);
+}
+int64_t qsa_selection_budget() { return selection_budget.load(std::memory_order_relaxed); }
+void qsa_set_selection_budget_from_geometry(int64_t geometry_top_k) {
+    const char* env = std::getenv("STRATA_QSA_BUDGET");
+    const long long v = env != nullptr ? std::atoll(env) : 0;
+    if (v > 0) {
+        std::fprintf(stderr, "strata: STRATA_QSA_BUDGET=%lld overrides the geometry's %lld\n", v,
+                     (long long) geometry_top_k);
+        qsa_set_selection_budget((int64_t) v);
+        return;
+    }
+    qsa_set_selection_budget(geometry_top_k);
+}
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device, int32_t pos_base,
                                const float* gamma, float epsilon, const QsaIndexerBuffers& b,
                                const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream) {

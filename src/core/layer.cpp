@@ -775,21 +775,28 @@ n += strata::kernels::qsa_decode_attn_scratch_floats(cap, s) * 4 + 16;
 return align_up16(n) + 256;}
 uint64_t qsa_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaBuffers& b) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);    Cursor c{(uint8_t*) base};    b.x_q8k = c.take_bytes(q8k_bytes(g.n_embd));    b.x_q8_0 = c.take_bytes((uint64_t) (g.n_embd / 32) * 34);    b.x_bf16 = c.take<uint16_t>((uint64_t) g.n_embd);    b.q_full = c.take<float>((uint64_t) g.n_head * 2 * g.head_dim);    b.qcur = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.kcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.vcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.idx_raw = c.take<float>((uint64_t) g.idx_key_dim);    b.q_idx = c.take<float>((uint64_t) g.idx_q_heads * g.idx_key_dim);    b.cell_scores = c.take<float>((uint64_t) max_cells);    b.ids = c.take<int32_t>((uint64_t) cap);
     // PLAIN MODE (`hc == 1`): the target has no indexer, and `qsa_selection_width` documents the selection as
-    // the IDENTITY below 2051 cells (`include/strata/kernels/qsa.hpp:131-132`, the author's own words) - so
-    // `qsa_layer` skips the indexer AND the top-k, and the id list it hands to `qsa_kv_resolve` / `kv_gather` /
-    // `qsa_attend` is this ramp, written ONCE here.  Those kernels read only the first `step[kStepWidth]` ids,
-    // and `kStepWidth == n_kv` below the bound, so the ramp IS the prefix 0..n_kv-1 at every token.  Nothing
-    // rewrites `b.ids` in plain mode, which also keeps it graph-constant (no per-token copy at all).
+    // the IDENTITY below the budget's bound (`include/strata/kernels/qsa.hpp:127-136`) - so `qsa_layer` skips the
+    // indexer AND the top-k, and the id list it hands to `qsa_kv_resolve` / `kv_gather` / `qsa_attend` is this
+    // ramp, written ONCE here.  Those kernels read only the first `step[kStepWidth]` ids, and the width is `n_kv`
+    // whenever the model's budget covers the context, so the ramp IS the prefix 0..n_kv-1 at every token.
+    // Nothing rewrites `b.ids` in plain mode, which also keeps it graph-constant (no per-token copy at all).
     // In the shipped mode `topk_512_step` overwrites it every token, so this fill is dead there.
+    //
+    // **THE RAMP IS `cap` ENTRIES, AND `cap` IS NOW 32,768 - NOT 2,051 (2026-10-10).**  The 4,096-entry stack
+    // array and the `cap > 4096 -> exit(1)` guard beside it were written when the only budget in the tree was
+    // Flash-Next's 2,048; with the model's own budget wired (`qsa_set_selection_budget`) `cap` is
+    // `qsa_selection_width(kTopkMaxCells)` = 32,768 = 128 KiB, so the ramp moves to the heap and the guard
+    // becomes the real capacity bound it always claimed to be.  A `cap` beyond `kTopkMaxCells` would mean the
+    // attention kernels' own contract is broken, which is worth a hard stop rather than a truncated ramp.
     {
-        if (cap > 4096) {
-            std::fprintf(stderr, "qsa_buffers_init: the selection cap %lld exceeds the identity ramp\n",
-                         (long long) cap);
+        if (cap > strata::kernels::kTopkMaxCells) {
+            std::fprintf(stderr, "qsa_buffers_init: the selection cap %lld exceeds kTopkMaxCells %lld\n",
+                         (long long) cap, (long long) strata::kernels::kTopkMaxCells);
             std::exit(1);
         }
-        int32_t ramp[4096];
-        for (int32_t i = 0; i < (int32_t) cap; ++i) ramp[i] = i;
-        cudaMemcpy(b.ids, ramp, (size_t) cap * sizeof(int32_t), cudaMemcpyHostToDevice);
+        std::vector<int32_t> ramp((size_t) cap);
+        for (int64_t i = 0; i < cap; ++i) ramp[(size_t) i] = (int32_t) i;
+        cudaMemcpy(b.ids, ramp.data(), (size_t) cap * sizeof(int32_t), cudaMemcpyHostToDevice);
     }
     b.k_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.v_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.attn = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn16 = c.take<uint16_t>((uint64_t) g.n_head * g.head_dim);    b.attn32 = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn_q8k = c.take_bytes(q8k_bytes(g.n_head * g.head_dim));    b.attn_scratch = c.take<float>(strata::kernels::qsa_decode_attn_scratch_floats(cap, s));    return c.used;}
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================

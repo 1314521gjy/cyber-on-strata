@@ -402,6 +402,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
 
+    // THE SAME SELECTION BUDGET THE ENGINE SETS (`generate.cpp`, next to `native_qsa_indexer_set_enabled`), from
+    // the same geometry field and through the same hook: `cap_` below sizes this checker's attention scratch, and
+    // the ids it reads are the engine's own `QsaBuffers::ids` ramp at the engine's stride.  Two different budgets
+    // here would be a stride mismatch, not a slower check.  (Setting the geometry's value directly here is what
+    // silently undid `STRATA_QSA_BUDGET` - the arm said 2,048 and `cap` was still 32,768.)
+    strata::kernels::qsa_set_selection_budget_from_geometry(g.idx_top_k);
     const strata::kernels::QsaShapes s = shapes_of(g);
     cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     max_blocks_ = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;

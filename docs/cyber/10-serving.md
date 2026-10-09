@@ -89,9 +89,15 @@ strata hc: CUDA0: the hyper-connection read runs as the plain one (STRATA_HC_SPL
 | 一次真实对话 | prompt **192** tokens → completion **19** tokens，`finish_reason=stop`，**143.1 tok/s**（短生成，只作方向） |
 | 加载显存 | `strata serve: 9711 MiB of VRAM free with everything loaded` |
 | 专家缓存 | 本例是**全常驻**档（`reserve 1500` ⇒ 10240 槽，18.32 GiB 显存） |
-| KV | `int8` + `--kv-resident 20480` ⇒ `KV streaming: 20480 of 32768 cells per QSA layer in VRAM, the K/V in 0.32 GiB of pinned RAM` |
+| KV | `int8` + **`--kv-resident 0`**（2026-10-10 更正：v1 这里是 `20480`，**会丢上下文**，见 `08-known-issues.md` U8）⇒ KV 全在显存 |
+| 长提示（Agent 体量） | prompt **21,018** tokens = 0 reused + 21,018 read in **7,339 ms（2,863.7 tok/s）**，32 generated（112.0 tok/s）；12k 提示 **3,993 tok/s** |
+| 工具调用 | ✅ 24 工具表 + 长工作区上下文 + 任务置末：非流式与流式都返回合法 `tool_calls`（`read_file` / `edit_file` 的 args 是 JSON 且指向真实路径），多轮回填后能给出答案 |
 
-**没测**：并发、工具调用（MCP）、图像、长上下文下的服务吞吐、多条请求后的 K/V 复用。这些都要看引擎与 serve 层的组合，不在本文的判据内。
+**没测**：并发、MCP、图像、多条请求后的 K/V 复用。这些都要看引擎与 serve 层的组合，不在本文的判据内。
+
+> ⚠️ **服务路径对引擎的缺陷最敏感**：Agent 的提示天生是 6–21k token，正好压在旧引擎那条
+> "只读前 2,051 格"的静默截断之上（`08-known-issues.md` U15，2026-10-10 已修）。若你手上的服务把
+> 长提示答成"你没有提问"，先核对引擎版本，再看 §2。
 
 ---
 

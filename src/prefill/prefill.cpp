@@ -518,6 +518,10 @@ struct Prefill::Impl {
     int32_t* steps_dev = nullptr;
     std::vector<int32_t> steps_host;
     int32_t* sel_ids = nullptr;
+    /// DENSE SELECTION ONLY (`ModelGeometry::plain_residual()`): the identity ramp the attention reads, one row
+    /// per tile query, `attn_batch * cap` entries, cudaMalloc'ed because the shared region's `base` is reused by
+    /// the MoE half (`qsa_set_bytes` above records the measurement).  `sel_ids` is null in that mode.
+    int32_t* dense_ids = nullptr;
     float* sel_scores = nullptr;          // [sel_batch, max_blocks]
     int64_t sel_batch = 256, max_blocks = 0;
     float* attn_scratch = nullptr;
@@ -657,12 +661,23 @@ uint64_t gdn_set_bytes(size_t T) {
     a.take<float>(T * HV, ok); a.take<float>(T * C, ok); a.take<float>(T * ZV, ok); a.take<uint16_t>(T * ZV, ok);
     return a.used;
 }
+/// The prompt half's QSA scratch.  `dense_sel` is `ModelGeometry::plain_residual()` (`hc == 1`), i.e. the model
+/// whose selection budget covers the whole context: there the selection is skipped ENTIRELY (`qsa_layer`'s
+/// "PLAIN MODE: NO selection at all", `layer.cpp:1020-1026`) and the ids the attention kernels read are the
+/// IDENTITY, which lives in `Impl::dense_ids` - NOT here.  **THE IDS CANNOT LIVE IN THIS REGION.**  `carve` hands
+/// the same `base` to three allocators (`Alloc a`, `b`, `c`), so the attention half and the MoE half REUSE one
+/// block of memory, and a ramp written once here is clobbered by the FIRST layer's MoE half: measured
+/// 2026-10-10, `ids[row31]` read back as `901283223 -1209789280 ...` at the first QSA layer and both attention
+/// kernels died on an illegal memory access.  The old flow survived the aliasing only because its SELECTION
+/// rewrote `T * cap` ids before every use.  So in dense mode `sel_ids` is not taken from the region at all (a
+/// stale `m.sel_ids` use would fault loudly at once) and the ramp is a cudaMalloc'ed buffer of its own; the
+/// `T * cap` take below is the SELECTION's buffer and only the non-dense path has one.
 uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_batch, int64_t attn_batch,
-                       const strata::kernels::QsaShapes& s) {
+                       bool dense_sel, const strata::kernels::QsaShapes& s) {
     Alloc a; a.count_only = true; bool ok = true;
     a.take<float>(T * 512, ok); a.take<float>(T * 512, ok); a.take<float>(T * QD, ok); a.take<float>(T * ZV, ok);
     a.take<float>(T * 128, ok); a.take<float>(T * 512, ok); a.take<float>(T * ZV, ok); a.take<uint16_t>(T * ZV, ok);
-    a.take<int32_t>(T * (size_t) cap, ok);
+    if (!dense_sel) a.take<int32_t>(T * (size_t) cap, ok);
     a.take<float>((size_t) sel_batch * (size_t) max_blocks, ok);
     a.take<float>((size_t) attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(cap, s), ok);
     return a.used;
@@ -903,12 +918,16 @@ bool Prefill::carve(size_t T, void* alloc) {
     s.idx_dim = g.idx_key_dim;
     m.cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     m.max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
+    // DENSE SELECTION: the model's budget covers the context, so nothing is pruned and the ids ARE the identity
+    // (`qsa_set_bytes` above carries the whole argument, including the 4 MiB vs 1 GiB count).
+    const bool dense_sel = g.plain_residual();
     {
         // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
         const bool fz = fused_layout(T, m.src != nullptr);
         const MoeBufs mb = moe_bufs(T, m.g->n_expert, fz);
         const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
-                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert, fz)});
+                                                                           m.attn_batch, dense_sel, s),
+                                          moe_set_bytes(T, m.g->n_expert, fz)});
         uint8_t* base = o.take<uint8_t>((size_t) region, ok);
         m.region = base;
         m.region_bytes = region;
@@ -922,9 +941,30 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.Kc = b.take<float>(T * 512, ok); m.Vc = b.take<float>(T * 512, ok); m.Qf = b.take<float>(T * QD, ok);
         m.q = b.take<float>(T * ZV, ok); m.idx_raw = b.take<float>(T * 128, ok); m.q_idx = b.take<float>(T * 512, ok);
         m.attn = b.take<float>(T * ZV, ok); m.attn_h = b.take<uint16_t>(T * ZV, ok);
-        m.sel_ids = b.take<int32_t>(T * (size_t) m.cap, ok);
+        m.sel_ids = dense_sel ? nullptr : b.take<int32_t>(T * (size_t) m.cap, ok);
         m.sel_scores = b.take<float>((size_t) m.sel_batch * (size_t) m.max_blocks, ok);
         m.attn_scratch = b.take<float>((size_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s), ok);
+        if (dense_sel && ok) {
+            // THE IDENTITY RAMP, AND IT IS cudaMalloc'ED ON PURPOSE (see `qsa_set_bytes` above): the region's
+            // `base` is shared by the attention half and the MoE half, so a ramp in there is overwritten before
+            // the first QSA layer reaches its attention and the kernels read garbage cells.  Row q's entry j is
+            // `j` - the cells the attention reads are 0..step[kStepWidth)-1 in order, the width differs per QUERY
+            // (it is that query's `n_kv`) while the pattern does not, so every tile of every chunk reuses this one
+            // buffer.  The kernels take `cap` as the row stride (`qsa_prompt_attn.cu:128`, `qsa_decode_attn.cu:92`),
+            // so the fill is laid out at that stride.  `Alloc` with no base and no `count_only` is exactly the
+            // owned-allocation path, so the block is freed with the object like every other buffer here.
+            Alloc own; own.owned = &m.owned;
+            m.dense_ids = own.take<int32_t>((size_t) m.attn_batch * (size_t) m.cap, ok);
+            std::vector<int32_t> ramp(ok ? (size_t) m.attn_batch * (size_t) m.cap : 0);
+            for (int64_t row = 0; ok && row < m.attn_batch; ++row)
+                for (int64_t j = 0; j < m.cap; ++j) ramp[(size_t) (row * m.cap + j)] = (int32_t) j;
+            if (ok && cudaMemcpyAsync(m.dense_ids, ramp.data(), ramp.size() * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
+                std::fprintf(stderr, "prefill: the dense identity id ramp (%lld rows of cap %lld) did not copy\n",
+                             (long long) m.attn_batch, (long long) m.cap);
+                ok = false;
+            }
+        }
         Alloc c;
         c.base = base; c.cap = region; c.owned = &m.owned;
         m.logits = c.take<float>(T * m.g->n_expert, ok); m.w = c.take<float>(T * K, ok); m.ids = c.take<int32_t>(T * K, ok);
@@ -1425,7 +1465,8 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     s.idx_dim = g.idx_key_dim;
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
-    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
+    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32,
+                                                                g.plain_residual(), s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, true))}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(GU * N, ok); o.take<uint16_t>(N * FF, ok); }
     if (mmq_plan().any) {
@@ -2251,7 +2292,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                     pt.mark(kPfQsaSel, cs);
-                    for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
+                    // DENSE SELECTION: `cap` is the model's whole-context budget, so the selection would return
+                    // every cell in ascending order - the identity - at the cost of scoring every block.  The
+                    // ids the attention reads are that identity already (`carve` wrote the ramp), which is also
+                    // why the buffer is `attn_batch` rows: this loop is the one writer that needs `T * cap`.
+                    for (int64_t t0 = 0; !g.plain_residual() && t0 < T; t0 += m.sel_batch) {
                         const int64_t nb = std::min(m.sel_batch, T - t0);
                         const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
                         // C-1: the grid reaches the batch's last query's n_bid (they rise with the position)
@@ -2269,7 +2314,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     // STRATA_SEL_OVERLAP (debug, D-1's question): how much do neighbouring queries' selections share?
                     // Per tile of 16 queries: the union of their selected cells against the sum of their widths.
-                    if (static const bool ovl = std::getenv("STRATA_SEL_OVERLAP") != nullptr; ovl && qsa_index == 0) {
+                    // DENSE: there is no selection to compare, and `m.sel_ids` is `attn_batch` rows, not `T`.
+                    if (static const bool ovl = std::getenv("STRATA_SEL_OVERLAP") != nullptr;
+                        ovl && !g.plain_residual() && qsa_index == 0) {
                         std::vector<int32_t> ids((size_t) (T * m.cap));
                         cudaMemcpyAsync(ids.data(), m.sel_ids, ids.size() * 4, cudaMemcpyDeviceToHost, m.cs);
                         cudaStreamSynchronize(m.cs);
@@ -2291,7 +2338,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // design's last question). Every query is selected again from the pooled keys and `dead` rounded
                     // to fp16 (exactly what an fp16 store reads back); the agreement with the fp32 selection is
                     // printed cumulatively after each chunk's last QSA layer. Debug: syncs per layer.
-                    if (static const bool f16chk = std::getenv("STRATA_IDX_FP16_CHECK") != nullptr; f16chk) {
+                    // DENSE: this probe re-runs the selection and compares it against `m.sel_ids`; with the
+                    // selection skipped and the ramp in that buffer there is nothing to compare (and the buffer
+                    // is `attn_batch` rows here - reading `T * cap` from it would be an out-of-bounds copy).
+                    if (static const bool f16chk = std::getenv("STRATA_IDX_FP16_CHECK") != nullptr;
+                        f16chk && !g.plain_residual()) {
                         static float *pooled16 = nullptr, *dead16 = nullptr;
                         static int32_t* ids16 = nullptr;
                         static double shared = 0, cells = 0;
@@ -2337,7 +2388,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // STRATA_QSA_DUMP=<file>: append every QSA layer's selected cells for the prompt's last
                     // STRATA_QSA_DUMP_LAST (4096) positions - records of int32 {qsa layer, pos0, T, cap} + T*cap cells,
                     // for tools/qsa_locality.py (how local the sparse attention's reads are: the KV-streaming question)
-                    if (static const char* dump = std::getenv("STRATA_QSA_DUMP"); dump != nullptr) {
+                    // DENSE: the dump is the SELECTION's id list (`tools/qsa_locality.py` measures how local the
+                    // sparse reads are); in dense mode `m.sel_ids` is the ramp and the buffer is `attn_batch` rows.
+                    if (static const char* dump = std::getenv("STRATA_QSA_DUMP");
+                        dump != nullptr && !g.plain_residual()) {
                         static const long long last = std::getenv("STRATA_QSA_DUMP_LAST")
                                                           ? std::atoll(std::getenv("STRATA_QSA_DUMP_LAST")) : 4096;
                         if (p0 + T > pos0 + n - last) {
@@ -2360,27 +2414,86 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
                     // V dequantized from its q4_0 blocks to fp16 at gather)
                     static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
-                    const bool pa_took = !old_attn && strata::kernels::qsa_prompt_attn_batch(
+                    bool pa_took = true;
+                    if (g.plain_residual()) {
+                        // DENSE: no selection ran, so `m.sel_ids` is ONE identity ramp per row (`carve` wrote it
+                        // once) and every tile of every chunk reuses it; the per-query cutoff is
+                        // `step[kStepWidth]`, which the budget has made that query's own `n_kv`.  The chunk is
+                        // attended TILE BY TILE because the kernels take `cap` as the ids row stride: handing
+                        // the whole chunk to one call would need `T * cap` ids = 1 GiB at `--prefill 8192`.
+                        // STRATA_DENSE_DEBUG=1: one dump of exactly what the kernels are handed - the buffers,
+                        // the ids actually in memory and the four step words of the first and last query.
+                        if (std::getenv("STRATA_DENSE_DEBUG") != nullptr) {
+                            static bool once = false;
+                            if (!once) {
+                                once = true;
+                                const size_t n_dump = (size_t) m.attn_batch * 8;
+                                std::vector<int32_t> ids_d((size_t) m.attn_batch * (size_t) m.cap);
+                                cudaMemcpy(ids_d.data(), m.dense_ids, ids_d.size() * 4, cudaMemcpyDeviceToHost);
+                                cudaStreamSynchronize(m.cs);
+                                std::fprintf(stderr, "DENSE-DBG: T=%lld p0=%lld cap=%lld attn_batch=%lld "
+                                                     "sel_batch=%lld region=%llu attn_scratch_bytes=%llu\n",
+                                             (long long) T, (long long) p0, (long long) m.cap,
+                                             (long long) m.attn_batch, (long long) m.sel_batch,
+                                             (unsigned long long) m.region_bytes,
+                                             (unsigned long long) ((size_t) m.attn_batch *
+                                                 strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s) * 4));
+                                std::fprintf(stderr, "DENSE-DBG: ids rows=%lld  ids[row0][0..7]=%d %d %d %d %d %d %d %d"
+                                                     "  ids[row1][0..3]=%d %d %d %d  ids[row%lld][0..3]=%d %d %d %d\n",
+                                             (long long) m.attn_batch,
+                                             ids_d[0], ids_d[1], ids_d[2], ids_d[3], ids_d[4], ids_d[5], ids_d[6], ids_d[7],
+                                             ids_d[(size_t) m.cap], ids_d[(size_t) m.cap + 1],
+                                             ids_d[(size_t) m.cap + 2], ids_d[(size_t) m.cap + 3],
+                                             (long long) (m.attn_batch - 1),
+                                             ids_d[(size_t) (m.attn_batch - 1) * (size_t) m.cap],
+                                             ids_d[(size_t) (m.attn_batch - 1) * (size_t) m.cap + 1],
+                                             ids_d[(size_t) (m.attn_batch - 1) * (size_t) m.cap + 2],
+                                             ids_d[(size_t) (m.attn_batch - 1) * (size_t) m.cap + 3]);
+                                std::fprintf(stderr, "DENSE-DBG: step[first]=pos %d nkv %d nbid %d width %d | "
+                                                     "step[last(t0=%lld)]=pos %d nkv %d nbid %d width %d\n",
+                                             m.steps_host[0], m.steps_host[1], m.steps_host[2], m.steps_host[3],
+                                             (long long) (T - 1),
+                                             m.steps_host[(size_t) (T - 1) * strata::kernels::kStepCount],
+                                             m.steps_host[(size_t) (T - 1) * strata::kernels::kStepCount + 1],
+                                             m.steps_host[(size_t) (T - 1) * strata::kernels::kStepCount + 2],
+                                             m.steps_host[(size_t) (T - 1) * strata::kernels::kStepCount + 3]);
+                            }
+                        }
+                        for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
+                            const int64_t nb = std::min(m.attn_batch, T - t0);
+                            const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
+                            if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q + t0 * ZV, pools, m.dense_ids,
+                                                                                    steps0, m.cap, s, m.attn + t0 * ZV,
+                                                                                    nb, m.cs)) {
+                                pa_took = false;
+                                strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.dense_ids, steps0, m.cap,
+                                                                       s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
+                            }
+                        }
+                    } else {
+                        pa_took = !old_attn && strata::kernels::qsa_prompt_attn_batch(
                                                             m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
                                                             m.attn, T, m.cs);
+                        if (!pa_took)
+                            for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
+                                const int64_t nb = std::min(m.attn_batch, T - t0);
+                                strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
+                                                                       m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
+                                                                       s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
+                            }
+                    }
                     // D 级诊断（S146 (c) 的临时探针，**验证后删**）。这是 `qsa_prompt_attn_batch` 的返回值
                     // 唯一的机器可读出处：改成 G=8 之后 `G * s.n_head_kv` 由 12*2=24 变成 8*2=16，恰好等于
                     // s.n_head(16)，所以 `qsa_prompt_attn.cu:1461` 的 guard 不再返回 false。**跑成 true 才是
                     // 真跑到了 tensor-core 核；仍旧 false 说明 guard 还挡着**（那时代码只是白改了）。
                     if (static bool said = false; !said) {
                         said = true;
-                        std::fprintf(stderr, "strata: qsa_prompt_attn_batch -> %d (old_attn=%d, T=%lld, "
+                        std::fprintf(stderr, "strata: qsa_prompt_attn_batch -> %d (old_attn=%d, dense=%d, T=%lld, "
                                              "n_head=%lld, n_head_kv=%lld, head_dim=%lld, cap=%lld)\n",
-                                     (int) pa_took, (int) old_attn, (long long) T, (long long) s.n_head,
-                                     (long long) s.n_head_kv, (long long) s.head_dim, (long long) m.cap);
+                                     (int) pa_took, (int) old_attn, (int) g.plain_residual(), (long long) T,
+                                     (long long) s.n_head, (long long) s.n_head_kv, (long long) s.head_dim,
+                                     (long long) m.cap);
                     }
-                    if (!pa_took)
-                        for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
-                            const int64_t nb = std::min(m.attn_batch, T - t0);
-                            strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
-                                                                   m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
-                                                                   s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
-                        }
                     if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * NH, m.cs);
                     pt.mark(kPfQsa, cs);
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);

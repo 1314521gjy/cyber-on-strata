@@ -35,13 +35,15 @@ strata.exe ^
   --max-context 4096 ^
   --max-new 512 ^
   --kv int8 ^
-  --kv-resident 20480 ^
+  --kv-resident 0 ^
   --spec 2 --suffix-draft 0 --mtp-max-t 1 ^
   --pool-workers 6 --pool-affinity all ^
   --stats
 ```
 
 > 发货默认值见本文档 `07-shipping-params.md` §3。
+> **2026-10-10 更正：`--kv-resident` 一律 `0`**（本节上面那行原本是 `20480`）—— 理由见 §2.2 与
+> `08-known-issues.md` 的 U8：只把常驻的 N 格交给注意力、其余被 mask ⇒ 丢上下文。
 
 ### 2.1 输入与身份
 
@@ -61,7 +63,7 @@ strata.exe ^
 | `--expert-cache auto` | 按 `free − reserve` 自动定槽数 | 发货一律 `auto`（写死槽数只用于实验） | auto |
 | `--max-context N` | KV 容量。4k 时 KV ≈ 100 MB 级（可忽略）；越长越吃显存 | 8 GB 卡 ≤8192 起步；要长上下文就配 `--kv` 压位宽 | 4096 |
 | `--kv fp16\|int8\|q4_0\|k8v4` | KV 位宽 | 显存紧就 `int8`；极端紧就 `k8v4` / `q4_0`（有精度代价，见 `06-memory-budget.md` §5） | **`int8`** |
-| `--kv-resident N` | KV 流式：每层只留 N 格在显存（下限 **20480**），整份 K/V 放**钉住的宿主内存** | 长上下文时用，实测 128k 可腾约 2.1 GiB 显存（`06-memory-budget.md` §5.2）；**与 `--kv k8v4` 不能同用**（引擎拒绝；`q4_0` 实测可同用） | **20480** |
+| `--kv-resident N` | KV 流式：每层只留 N 格在显存（下限 **20480**），其余放**钉住的宿主内存** | 🔴 **一律 `0`**（2026-10-10 更正，原本这里是"长上下文时用"，**错**）：引擎只把常驻的 N 格交给注意力，其余 cell 被 mask（`qsa_decode_attn.cu`）⇒ **丢上下文**；`20480` 还会卡住**提示读取**（实测 21,385 token 只读 18,432，0 输出）。腾显存的历史读数见 `06-memory-budget.md` §5.2（保留）。**与 `--kv k8v4` 不能同用**（引擎拒绝） | **0** |
 | `--prefill CHUNK` | 预填分块；`auto` = 能借多少缓存借多少（上限 8192） | 富余用 `auto`；紧就用 2048 | 2048 |
 
 ### 2.3 计算与调度

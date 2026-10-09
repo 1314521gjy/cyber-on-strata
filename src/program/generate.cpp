@@ -2355,6 +2355,29 @@ int main(int argc, char** argv) {
     strata::kernels::native_qsa_set_enabled(o.native_qsa);
     strata::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);
     strata::kernels::native_rope_set_enabled(o.native_rope);
+    // THE SELECTION BUDGET (`strata/kernels/qsa.hpp:qsa_selection_width`), SET BEFORE ANY BUFFER IS SIZED OR ANY
+    // GRAPH IS CAPTURED.  `attention.indexer.top_k` is a per-model number and `ModelGeometry` already carries it
+    // (`layout.hpp:60-62`: Whittle-Next 262,144 = the whole context, nothing pruned; Flash-Next 2,048).
+    // `qsa_shapes()` does not copy the field and the `qsa_real_shapes()` call sites cannot see the geometry, so
+    // this one call is what makes every width, capacity and kernel argument in the process agree.  The size_t
+    // cast is not decoration: `idx_top_k` is read from the geometry, not from a shape, and 262144 + idx_block - 1
+    // is what turns `step[kStepWidth]` into `n_kv` (below 2,052 cells the two are the same number, which is why
+    // this defect survived every <= 2,003-token check we ever ran).
+    strata::kernels::qsa_set_selection_budget(g.idx_top_k);
+    std::fprintf(stderr,
+                 "strata generate: QSA selection budget %lld cells (geometry attention.indexer.top_k; shapes "
+                 "carried %lld) -> width = min(n_kv, budget + block - 1), so width == n_kv for every context up "
+                 "to %lld cells\n",
+                 (long long) strata::kernels::qsa_selection_budget(),
+                 (long long) strata::kernels::qsa_real_shapes().idx_top_k,
+                 (long long) strata::kernels::qsa_selection_width(1 << 20, strata::kernels::qsa_real_shapes()));
+    // STRATA_QSA_BUDGET=N: the bisection hook for the truncation fix.  The budget is a compile-time geometry
+    // field (`layout.hpp:62`), so without this a "is it the width or is it the buffer layout?" question costs a
+    // rebuild per arm.  N = 2048 restores the pre-2026-10-10 widths exactly (`qsa_selection_width` still takes
+    // the max of the two), N = 262144 is the model's own value; unset means "the geometry decides".  The hook
+    // lives in `qsa_set_selection_budget_from_geometry` so that `verify.cpp`, which runs later and used to put
+    // the geometry's value back, cannot undo it.
+    strata::kernels::qsa_set_selection_budget_from_geometry(g.idx_top_k);
     // The vision path: every rope kernel reads a cell's (t, h, w) from this table (strata/kernels/mrope.hpp).  It is
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
     int32_t* d_mrope = nullptr;

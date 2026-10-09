@@ -61,9 +61,9 @@
 
 | # | 未验项 | 现状 |
 |---|---|---|
-| U6 | **`--serve` 旗标** | 参数解析能过；**没用过** ⇒ 不要承诺 API / 服务端 |
+| U6 | ~~**`--serve` 旗标**~~ **已验（2026-10-10）** | 引擎侧 `--serve`（stdin/stdout 行式 JSON）**每天在用**：21k token 的 Agent 形提示、工具调用、流式都跑通。OpenAI / Anthropic 那层是本仓库之外的 python 封装（引擎侧不再是未验项） |
 | U7 | **`--vram-elastic` / `--batch` / `--slots`** | 只在 `--serve` 下有意义 ⇒ 未验 |
-| U8 | **`--kv-resident` 的速度代价** | 腾显存**已实测有效**（128k 下腾出 2.11 GiB）；但每步要从钉住内存取 K/V 走 PCIe，**代价 n=1、判不了** |
+| U8 | ~~**`--kv-resident` 的速度代价**~~ **2026-10-10 结案：不要用这个开关** | 它不是"腾显存、代价未知"，而是**会丢上下文**：引擎只把被做成常驻的那 N 格交给注意力，其余 cell 在核心里被直接 mask（`qsa_decode_attn.cu`：`page = -1 ⇒ score = -FLT_MAX`）；且 `20480` 会卡住**提示读取**（实测 21,385 token 只读 18,432，0 输出）。腾显存的历史读数仍有效（`06-memory-budget.md` §5.2），但**默认已改为 `0`** |
 | U9 | **`--kv k8v4` 与 `--kv-resident` 组合** | 引擎**拒绝**（help 明写）⇒ 这个组合永远不会被跑到 |
 | U10 | **`--prefill auto:32768`** | 只影响 TTFT，未跑 |
 | U11 | **`--pool-affinity auto`** | 结论矛盾：一批 `pool` 10.88→5.66，另一批复现失败（5.27/6.05 ↔ 8.09/9.83）⇒ **未确认** |
@@ -75,7 +75,7 @@
 
 | # | 未验项 | 现状 |
 |---|---|---|
-| U15 | **`idx_top_k` 未接线 = 正确性缺口** | `n_kv ≥ 2052` 时**静默只读前 2051 cells**；与 `src/core/layer.cpp` 里 `cap>4096 → exit(1)` 冲突。当前靠"零 indexer 垫片 + 恒等选择"绕开，**硬墙仍在** |
+| U15 | ~~**`idx_top_k` 未接线 = 正确性缺口**~~ **已修（2026-10-10）** | **根因**：`qsa_real_shapes()` 带的是上游靶子的 `idx_top_k = 2048`，而本模型的 `attention.indexer.top_k` = **262144**（整个上下文、从不剪枝）⇒ `qsa_selection_width() = min(n_kv, 2048 + 4 - 1)` **恒 ≤ 2051** ⇒ 提示一超过它，**尾部对模型就不存在**（实测 2,045 token✅ / 2,085 token❌，llama.cpp 同题在 12,812 token 上通过）。**修法**：① 预算改成模型几何口径（`qsa_set_selection_budget_from_geometry`，一处定义、`layer.cpp` 与 `prefill.cpp` 的每个 width/capacity 派生点自动一致）；② `layer.cpp` 的恒等斜坡从栈上 4096 改成按 `cap` 堆分配、闸门提到 `kTopkMaxCells`；③ 提示路径的恒等 id 移出"注意力半边与 MoE 半边复用同一 base"的 region（否则第一层就被冲掉 ⇒ 两个注意力核都报非法访存）。**判据**：尾部指令在 2,085 / 2,885 / 5,624 / 11,988 / 21,018 token 上**全部命中**；**负控**=同一二进制把预算拨回 2,048 ⇒ 2,085 与 2,885 立刻丢尾（模型原话："There's no actual question"）。Agent 形 A/B（24 工具 + 长工作区 + 任务置末）同样由 `list_dir(".")` 变回正确工具调用。详见 `09-fork-changelog.md` |
 | U16 | **`9167` 的精确 rank 与 prob 上界** | k=10 只给"在 top-10 内"；更大 k 需重跑一次 2003-id 采样臂，**未跑** |
 | U17 | **分岔点两侧 logits 的逐位对照** | 需要 `--dump-logits` 臂，**未跑** |
 | U18 | **index 7 提前分岔的定性** | 已判为"长上下文效应"（16-id prompt 上两 profile 输出**全同**），但机制未查明 |

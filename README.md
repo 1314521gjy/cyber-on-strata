@@ -119,8 +119,13 @@ cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=75;86;89;120 -DSTRATA_MMQ_KQUANTS
 - `--max-context` 决定它多大：**实测 fp16 约 21.6 KiB/token** ⇒ 4k≈86 MiB、32k≈690 MiB、128k≈2.76 GiB。
 - 它**可以挪进钉住内存**：`--kv-resident N`（每层留 N 格在显存）。实测 128k 上下文下
   **花 2.5 GiB 内存换回 2.11 GiB 显存**。
-- 也可以**压精度**：`int8`（= k8v8）/ `k8v4` / `q4_0`。**注意 `k8v4` 与 `--kv-resident` 互斥**。
-  本项目的默认是 **`int8` + `--kv-resident 20480`** —— 选它是因为 `int8` 的数值**与 fp16 逐位一致**，
+  > 🔴 **2026-10-10 更正：不要开这个开关（默认已改为 `0`）。** 引擎只把**被做成常驻的那 N 格**交给注意力，
+  > 其余 cell 在核心里被**直接 mask**（`src/kernels/cuda/qsa_decode_attn.cu`：`page = -1 ⇒ score = -FLT_MAX`）
+  > ⇒ **丢上下文**；而 `20480` 还会卡住**提示读取**（实测 21,385 token 的提示只读了 18,432，随后 0 输出）。
+  > 上面的腾显存读数是真实的历史数据、**保留不动**，但配置不要再照它做 —— 见 `docs/cyber/08-known-issues.md` U8。
+- 也可以**压精度**：`int8`（= k8v8）/ `k8v4` / `q4_0`。（`k8v4` 与 `--kv-resident` 互斥，引擎直接拒绝该组合；
+  本项默认已不再使用 `--kv-resident`，所以与你无关。）
+  本项目的默认是 **`int8` + `--kv-resident 0`** —— 选 `int8` 是因为它的数值**与 fp16 逐位一致**，
   不破坏已经建立的正确性锚。
 
 ---
@@ -133,7 +138,7 @@ cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=75;86;89;120 -DSTRATA_MMQ_KQUANTS
 | `--expert-cache auto` | — | 按 `空闲显存 − reserve` 自动定槽数 |
 | `--max-context` | 4096 | KV 容量 |
 | `--kv` | **int8** | KV 精度（引擎自带默认是 fp16） |
-| `--kv-resident` | **20480** | KV 挪进钉住内存 |
+| `--kv-resident` | **0**（关） | **不要开**：只把常驻的那 N 格交给注意力、其余被 mask ⇒ 丢上下文（U8） |
 | `--prefill` | 2048 | 预填分块 |
 | `--expert-profile` | — | 静态预填，**命中率的主要来源**（不带它，默认策略实测只有 2.97% 命中） |
 | `--pool-workers` / `--pool-affinity` | 0 / auto | CPU 专家池线程数与绑核 |

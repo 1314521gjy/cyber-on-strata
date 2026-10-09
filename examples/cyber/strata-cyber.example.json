@@ -9,7 +9,11 @@
         "  <LOGDIR>  a writable directory for the engine log",
         "  <CUDA>    the CUDA bin directory holding the runtime DLLs (e.g. .../cuda/bin/x64)",
         "No --mtp: this model's MTP draft block is not compatible with the runtime-directory",
-        "format (see docs/cyber/10-serving.md).  --spec 2 keeps the verify windows, without drafts."
+        "format (see docs/cyber/10-serving.md).  --spec 2 keeps the verify windows, without drafts.",
+        "--kv-resident MUST stay 0: a nonzero value makes the engine hand attention only the cells it",
+        "made resident and mask the rest, i.e. it drops context (docs/cyber/08-known-issues.md U8).",
+        "sampling: the four values the serving path was validated with, aligned with the llama.cpp",
+        "reference server (temperature 0.6 / top_p 0.95 / top_k 20 / min_p 0)."
     ],
     "exe": "<REPO>/build/strata.exe",
     "args": [
@@ -22,7 +26,7 @@
         "--prefill", "2048",
         "--max-context", "32768",
         "--kv", "int8",
-        "--kv-resident", "20480",
+        "--kv-resident", "0",
         "--spec", "2",
         "--suffix-draft", "0",
         "--mtp-max-t", "1",
@@ -36,6 +40,12 @@
         "<CUDA>"
     ],
     "port": 8091,
+    "sampling": {
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0
+    },
     "reasoning_budget_tokens": 0,
     "anthropic_thinking": "model"
 }
