@@ -1,16 +1,18 @@
-# cyber-on-strata
+# 8 GB 显存跑 35B MoE · Cyber on Strata
 
-> **项目目标：让显存不足的人也能体验 Ornith-1.5 MoE（Cyber-Tiel-Coder-35B-A3B）。**
-> **Goal: let people without enough VRAM still run Ornith-1.5 MoE.**
+**一句话**：把 22.75 GB 的 **Cyber-Tiel-Coder-35B-A3B** 跑在 **8 GB 显存的显卡**上 ——
+专家权重留在内存、按需上卡，没命中 GPU 缓存的专家**就地交给 CPU 线程池算**。
+实测（RTX 4080 SUPER）：8 GB 档 **57.7–63.5 tok/s**，全常驻档 **134–136 tok/s**。
 
-**在 8 GB 显存的显卡上跑起 35B MoE：专家权重流式上卡、未命中专家由 CPU 池就地计算。**
-
-> An expert-streaming inference setup for **Cyber-Tiel-Coder-35B-A3B** (`qwen35moe`, 256 routed
-> experts, top-8), built as a fork of the [Strata](https://github.com/Niko1221/Strata) engine.
-> Weights stay resident in system RAM and are paged onto the GPU on demand; experts that miss the
-> GPU cache are computed in place by a CPU thread pool. Measured on an RTX 4080 SUPER:
-> **57.7–63.5 tok/s decode** with a 4.2 GiB expert cache, **134–136 tok/s** when the whole expert
-> set fits in VRAM. See [`docs/cyber/`](docs/cyber/) for the full engineering record.
+> **What this is**: an expert-streaming inference setup for **Cyber-Tiel-Coder-35B-A3B**
+> (`qwen35moe`, 256 routed experts, top-8), built as a fork of the
+> [Strata](https://github.com/Niko1221/Strata) engine (MIT). Weights stay resident in system RAM and
+> are paged onto the GPU on demand; experts that miss the GPU cache are computed in place by a CPU
+> thread pool. Measured on an RTX 4080 SUPER: **57.7–63.5 tok/s decode** with a 4.2 GiB expert
+> cache, **134–136 tok/s** when the whole expert set fits in VRAM.
+> ⚠️ **This fork, not upstream**: the upstream engine does not support this model (it reads
+> `qwen4exp.*` metadata only and rejects `--no-ple` with `--native`). Build from **this** repo.
+> See [`docs/cyber/`](docs/cyber/) for the full engineering record.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![CUDA arch](https://img.shields.io/badge/CUDA%20arch-sm__75%20%7C%20sm__86%20%7C%20sm__89%20%7C%20sm__120-blue.svg)](#显卡要求)
@@ -39,8 +41,10 @@
                            磁盘上的 GGUF（22.75 GB）
 ```
 
-三个关键点：**专家缓存按剩余显存自适应**、**KV 可以整体挪进钉住内存换显存**、
+三个关键点：**专家缓存按剩余显存自适应**、**KV 可压位宽（`int8` 与 fp16 数值逐位一致）**、
 **未命中的专家不搬回 GPU，而是交给 CPU 池就地算**。
+（`--kv-resident` 那条"把 KV 整体挪进钉住内存换显存"的路**不要走**：引擎会把它没做成常驻的 cell
+直接 mask 掉 ⇒ 丢上下文。见 `docs/cyber/08-known-issues.md` U8。）
 
 ---
 
