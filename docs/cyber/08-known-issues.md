@@ -162,4 +162,27 @@
 | 1 | 看门狗顺序改动（`fflush` 提到 `stall_report` 之前） | 需要一次真的"60 s 无进展" | 本轮没触发；改动零行为变化，只保证报告先落盘 |
 | 2 | 专家银行钉住量自动收（`min(请求值, 可用内存 − 余量)`） | 需要一台可用内存小于专家银行的机器（内测那台 31.29 GB） | 本机 96 GB 不触发；该规则在内测读数下算出 ~12 GiB（实测 12 可用 / 14 崩） |
 | 3 | 探针失败与 8 KB 分配失败的新报错措辞 | 需要 `cudaMemGetInfo` 失败、或宿主内存被钉干的状态 | 本机不出现 ⇒ 只验了"改动后正常路径仍正常" |
-| 4 | **中文路径修复**（`utter8_or_ansi_to_wide` + `path_exists`，4 处文件打开） | 在**中文目录**下跑 `--mmap-experts`（可用目录联接挂载 pack，不必复制 80 MB） | **未验** ⇒ 文档仍建议把包放在纯 ASCII 路径 |
+| 4 | **中文路径修复**（`utf8_or_ansi_to_wide` + `path_exists`，4 处文件打开） | 在**中文目录**下跑 `--mmap-experts`（可用目录联接挂载 pack，不必复制 80 MB） | **未验** ⇒ 文档仍建议把包放在纯 ASCII 路径 |
+
+---
+
+## §9 v3 补丁里一处**自报文字是错的**（未修，登记在案）
+
+`src/program/generate.cpp` 在钉住量被压时打的那一行：
+
+```
+strata generate: the expert arena pinning is capped to X GiB (available RAM A GiB - H GiB headroom; STRATA_ARENA_PIN_GIB overrides)
+```
+
+**括号里那句不成立**：`STRATA_ARENA_PIN_GIB` 设的值走的是同一个分支（`pin_limit > room ⇒ pin_limit = room`），
+**一样会被压到 `可用内存 − 8 GiB`**，它并不 "override"。同一处 `src/core/pinned.cu` 在上限真的生效时写的是
+`cudaHostRegister limited to N GiB by the engine (multi-GPU under WDDM, or remote experts)` —— 而真实原因可能是
+可用内存余量（"WDDM 多卡" 只在多卡 / 远端专家时才是原因）。
+
+| 项 | 内容 |
+|---|---|
+| 影响面 | **只有诊断文字**：行为、读数、内存占用都不变；**每台机器每次启动都会看到那一行** |
+| 判据 | 该行原文出现在本机运行日志里（日志未随仓库发布）：`capped to 73.13 GiB (available RAM 81.13 GiB - 8.00 GiB headroom; STRATA_ARENA_PIN_GIB overrides)` |
+| 怎么变红 | 在一台"可用内存 − 8 GiB < 请求值"的机器上设 `STRATA_ARENA_PIN_GIB=<请求值>`：日志会同时出现 `capped to …` 与 `STRATA_ARENA_PIN_GIB=N: the expert arena's pinning is capped` ⇒ 两句自相矛盾 |
+| 修法（与下一批引擎改动一起做） | 把"请求值"与"实际生效值"一起打出来，把原因串透传给 `PinnedArena`（现在的默认原因串是错的），并把 `STRATA_RESIDENT_HEADROOM_GIB` 接成真正的出口 |
+| 已发货的 v3 内测包 | **照原样保留**（包内 `先读我.md` §6 与发货文档 §8.3 都写了这条） |
