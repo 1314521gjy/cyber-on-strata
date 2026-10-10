@@ -649,7 +649,11 @@ void usage() {
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
-                 "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
+                "  --vram-reserve-mib N  VRAM held back from the expert cache for the KV cache, the activations and\n"
+                "                       the desktop: slots = (free - N) / blob.  THIS IS THE ONE KNOB THAT HAS TO\n"
+                "                       MATCH THE CARD; the engine prints what it chose (expert cache auto: ...).\n"
+                "                       NOTE: --pool-workers beyond the physical core count has no benefit.\n"
+                "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
                  "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8),\n"
@@ -3237,7 +3241,26 @@ int main(int argc, char** argv) {
         // such limit, so there the whole arena is pinned (#253).  STRATA_ARENA_PIN_GIB overrides both ways.
         const int pin_env = strata::core::arena_pin_cap_gib();   // -1 unset, -2 "auto" (#243, Windows sliced pin)
         const bool pin_wddm_cap = pin_env < 0 && (o.expert_cache_remote[0] > 0 || multi_gpu) && under_wddm();
-        const uint64_t pin_limit = pin_env >= 0 ? (uint64_t) pin_env << 30 : pin_wddm_cap ? (8ull << 30) : 0;
+        uint64_t pin_limit = pin_env >= 0 ? (uint64_t) pin_env << 30 : pin_wddm_cap ? (8ull << 30) : 0;
+        // **NEVER PIN THE HOST DRY (2026-10-10).**  The arena is 18.32 GiB; pinning all of it on a 31.29 GB machine
+        // whose own "available RAM" reading is 19.96 GiB leaves nothing, and then every later CUDA call fails
+        // (cudaMemGetInfo -> "0.00 GiB free", an 8 KB cudaMalloc -> "the embedding buffer failed").  Measured on
+        // that machine: 12 GiB worked, 14 GiB crashed - and the rule below lands near 12 GiB there while doing
+        // nothing on a big machine.  It is the same headroom the resident-complement path already uses.
+        {
+            const uint64_t avail_ram = strata::core::available_ram_bytes();
+            if (avail_ram > o.resident_headroom) {
+                const uint64_t room = avail_ram - o.resident_headroom;
+                if (pin_limit == 0 || pin_limit > room) {
+                    std::fprintf(stderr,
+                                 "strata generate: the expert arena pinning is capped to %.2f GiB (available RAM "
+                                 "%.2f GiB - %.2f GiB headroom; STRATA_ARENA_PIN_GIB overrides)\n",
+                                 (double) room / 1073741824.0, (double) avail_ram / 1073741824.0,
+                                 (double) o.resident_headroom / 1073741824.0);
+                    pin_limit = room;
+                }
+            }
+        }
         if (pin_env >= 0)
             std::fprintf(stderr, "strata generate: STRATA_ARENA_PIN_GIB=%d: %s\n", pin_env,
                          pin_env == 0 ? "the whole expert arena is pinned" : "the expert arena's pinning is capped");
@@ -3290,7 +3313,17 @@ int main(int argc, char** argv) {
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        // **A FAILED PROBE IS NOT "0 MiB FREE" (2026-10-10).**  The return code was ignored, so a machine where
+        // `cudaMemGetInfo` fails printed `0.00 GiB free ... -> 0 slots` and then stopped on a later 8 KB
+        // allocation, with nothing naming the real error.  Measured on an 8 GB laptop whose expert-arena
+        // `cudaHostRegister` had failed first (that stale error is what makes the probe fail there).
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "strata generate: cudaMemGetInfo failed, so the free VRAM is unknown and the expert "
+                                 "cache cannot be sized.  This is NOT the same as having no VRAM: an earlier CUDA call "
+                                 "in this process failed, and the line above it names it.\n");
+            return 1;
+        }
         // Plan v0.3 P5: the batched prompt path's chunk buffers are allocated later, so they are reserved here -
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead; `pf_borrow` is
@@ -3958,7 +3991,15 @@ int main(int argc, char** argv) {
     };
     float* d_emb = nullptr;
     if (cudaMalloc(&d_emb, (size_t) g.n_embd * 4) != cudaSuccess) {
-        std::fprintf(stderr, "strata generate: the embedding buffer failed\n");
+        // **NAME THE REAL ERROR (2026-10-10).**  This allocation is `n_embd * 4` = 8 KB: when it fails on a
+        // card with free VRAM the cause is earlier (a failed `cudaHostRegister` that pinned the host dry leaves
+        // the error set), and the old message said nothing about that.  Measured on an 8 GB laptop.
+        // The error is read FIRST: `vram_free_note()` calls `cudaGetLastError()` itself (and clears it), and the
+        // argument order of a call is unspecified - reading the error inline could have printed "no error".
+        const cudaError_t ce = cudaGetLastError();
+        const std::string note = vram_free_note();
+        std::fprintf(stderr, "strata generate: the %zu-byte embedding buffer failed: %s%s\n",
+                     (size_t) g.n_embd * 4, cudaGetErrorString(ce), note.c_str());
         return 1;
     }
     // **`sample_tokens` TAKES DEVICE POINTERS.**  It is a kernel launch; `logits` and `out` are both read and
@@ -5845,9 +5886,13 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s) - stopping "
                                              "the engine so the server starts it again (issue #29)\n",
                                      limit, stage_text().c_str());
-                        stall_report(stderr, p.ticks.load() - ticks_at);
-                        strata::core::release_gpu_waits(stderr);   // #267: no spin kernel outlives the process
+                        // **THE REPORT GOES OUT BEFORE ANYTHING ELSE CAN FAULT (2026-10-10).**  This used to
+                        // be `... -> release_gpu_waits -> fflush -> abort`, so a run that died inside
+                        // `release_gpu_waits` left NOTHING in the log (silent 45-78 s stall, bare 0xC0000005).
                         std::fflush(stderr);
+                        stall_report(stderr, p.ticks.load() - ticks_at);
+                        std::fflush(stderr);
+                        strata::core::release_gpu_waits(stderr);   // #267: no spin kernel outlives the process
                         std::abort();
                     }
                 }).detach();
@@ -7102,16 +7147,31 @@ int main(int argc, char** argv) {
                         if (i >= o.prompt_cache_root) root_at = i;
                         break;
                     }
+            // **A SEGMENT SHORTER THAN 256 TOKENS IS NOT READ AS ITS OWN SEGMENT (2026-10-10).**  The
+            // turn-boundary split can leave a tail of a handful of tokens - measured on an 8 GB machine: 5 of
+            // 19,105, with the read stuck at `19,100 of 19,105` for 60 s and then an access violation with an
+            // empty log.  Such a segment is far too short to lend for and it went down the WINDOW path; it now
+            // rides the previous segment's loan through the batched path (what a 2-token prompt always used).
+            // The checkpoint at the boundary still happens - only the READ is no longer split there.
+            std::fprintf(stderr, "strata serve: prompt split read_from=%lld reread_to=%lld root_at=%lld turn_at=%lld n=%lld\n",
+                         (long long) read_from, (long long) reread_to, (long long) root_at, (long long) turn_at,
+                         (long long) n);
             int64_t at = read_from;
             for (const int64_t to : {reread_to, root_at, turn_at, n - 1}) {
                 if (to <= at) continue;
                 err.clear();
-                const bool win = windows_ok(at, to);
+                // ANY segment below the floor is read batched - INCLUDING THE FIRST one after a checkpoint
+                // resume (`read_from` is the checkpoint then, and the tail of that conversation is the same ~4
+                // tokens), and it lends for the engine's own minimum chunk (256, the floor `relend` uses; a
+                // 4-token loan is no loan at all).  Measured on this machine 2026-10-10: the window path on a
+                // 4-token segment crashed the engine with 0xC0000005 on BOTH the first and the resumed request.
+                const bool tiny = to - at < 256;   // the note before the loop
+                const bool win = !tiny && windows_ok(at, to);
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
-                if (!win && !lend(to - at, err)) {
+                if (!win && !lend(tiny ? 256 : to - at, err)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;
                 }

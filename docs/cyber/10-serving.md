@@ -124,3 +124,25 @@ strata hc: CUDA0: the hyper-connection read runs as the plain one (STRATA_HC_SPL
 ```
 
 第 5 条是踩过的：服务层自己的报错（例如"引擎在就绪前退出"）**不会**写进 runconfig 的 `log`，只打到它自己的 stdout/stderr。
+
+---
+
+## §5 前缀复用：默认关，开了值多少（2026-10-10 实测，`A` 级）
+
+agent 客户端（DSH 形态）**每轮重发整段历史**，所以复用与否是一轮几秒的事。两臂在同样的显存状态下各跑一组：
+
+| 轮次（历史 12.5k） | 无 `--prompt-cache` | 有 `--prompt-cache 4` |
+|---|---|---|
+| 1 | `0 reused + 12502 read in 3193 ms` | `0 reused + 12502 read in 3304 ms` |
+| 2 | `0 reused + 12593 read in 3109 ms` | **`12497 reused + 96 read in 296 ms`** |
+| 3 | `0 reused + 12684 read in 3142 ms` | **`12588 reused + 96 read in 299 ms`** |
+| 每轮 wall | 3.26–3.37 s | **0.45 s** |
+
+- 读取 **~10.5×**、每轮 wall **~7×**；省下的量正比于历史长度（复用的是整个前缀）。内测那台 8 GB 真机
+  每轮要读 75k token（123 s），开了之后只读新增的几百 token。
+- **默认是关的**（`--prompt-cache 0`），`--help` 与 `docs/DETAILS.md` 的措辞是 "opt in only for the
+  prompt-reuse speed-up"；引擎会自己说明代价：*"a batch split is not numerically neutral, so serve can then
+  answer differently from the CLI on the same request"* ⇒ 这是**数值口径上的取舍**，不是纯提速。
+- 成本：每个检查点占内存 ~118 MB（`--prompt-cache 4` ≈ 470 MB）。
+- ⚠️ **一次只跑一个引擎。** 两个引擎同卡时（实测：另一个引擎占着 ~24 GB），我们的 18.32 GiB 专家缓存
+  装不下 ⇒ WDDM 分页 ⇒ 同一提示的读取在 1092–3919 tok/s 之间跳，所有读数作废。

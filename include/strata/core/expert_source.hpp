@@ -43,6 +43,10 @@ struct ExpertLayout;
 
 namespace strata::core {
 
+/// The system's available RAM in bytes, or 0 when it cannot be read (generate.cpp caps the expert
+/// arena's pinning with it - never pin the host dry).
+uint64_t available_ram_bytes();
+
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
 struct LoadStats;

@@ -152,3 +152,14 @@
 | U30 提权通道 vs 直启 −8.7 | 两条通道的读数差，**未定位** |
 | U31 探针删除与哈希回归 | `src/prefill/prefill.cpp` 的探针仍在（本文档 `09-fork-changelog.md` §3） |
 | 测试覆盖范围 | `tests/core/expert_layout_test.cpp`、`tests/core/expert_cache_per_layer_test.cpp`、`tests/core/expert_cache_segmented_test.cpp`、`tests/cuda/prefill_mmq_kquant_test.cpp` |
+
+---
+
+## §8 2026-10-10 v3 补丁的未验清单（**四件事要特定条件才能验**）
+
+| # | 未验项 | 触发条件 | 现状 |
+|---|---|---|---|
+| 1 | 看门狗顺序改动（`fflush` 提到 `stall_report` 之前） | 需要一次真的"60 s 无进展" | 本轮没触发；改动零行为变化，只保证报告先落盘 |
+| 2 | 专家银行钉住量自动收（`min(请求值, 可用内存 − 余量)`） | 需要一台可用内存小于专家银行的机器（内测那台 31.29 GB） | 本机 96 GB 不触发；该规则在内测读数下算出 ~12 GiB（实测 12 可用 / 14 崩） |
+| 3 | 探针失败与 8 KB 分配失败的新报错措辞 | 需要 `cudaMemGetInfo` 失败、或宿主内存被钉干的状态 | 本机不出现 ⇒ 只验了"改动后正常路径仍正常" |
+| 4 | **中文路径修复**（`utter8_or_ansi_to_wide` + `path_exists`，4 处文件打开） | 在**中文目录**下跑 `--mmap-experts`（可用目录联接挂载 pack，不必复制 80 MB） | **未验** ⇒ 文档仍建议把包放在纯 ASCII 路径 |

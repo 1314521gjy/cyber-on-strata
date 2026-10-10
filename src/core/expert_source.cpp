@@ -24,6 +24,7 @@
 #include <fstream>
 #include <filesystem>
 #include <sstream>
+#include <string>
 #include <limits>
 #include <map>
 #include <memory>
@@ -337,6 +338,47 @@ bool available_memory_bytes(uint64_t& bytes) {
 
 FileExpertSource::~FileExpertSource() { close(); }
 
+// **HOW MUCH RAM IS THERE, IN ONE PLACE (2026-10-10).**  `generate.cpp` caps the expert arena's pinning with it:
+// pinning the whole 18.32 GiB arena on a machine whose available RAM is ~20 GiB leaves nothing, and every CUDA
+// call after that fails (`cudaMemGetInfo` -> 0 free, an 8 KB `cudaMalloc` -> "the embedding buffer failed").
+uint64_t available_ram_bytes() {
+    uint64_t b = 0;
+    return available_memory_bytes(b) ? b : 0;
+}
+
+#if defined(_WIN32)
+/// **TRY UTF-8, THEN THE ANSI CODEPAGE (2026-10-10).**  The strings this program carries are not one encoding:
+/// the serve layer writes its config as JSON (UTF-8), while `main`'s `argv` is the ANSI codepage, and the ARENA's
+/// own file opens go through the ANSI narrow path - which is why a pack under a Chinese directory worked in the
+/// resident mode and failed in `--mmap-experts` with "FileExpertSource: cannot open ..." (measured on an 8 GB
+/// laptop).  `MultiByteToWideChar(CP_UTF8)` on ANSI bytes produces mojibake; CP_ACP on UTF-8 bytes does the same.
+/// UTF-8 with `MB_ERR_INVALID_CHARS` fails on invalid sequences, so this picks the right one per string.
+std::wstring utf8_or_ansi_to_wide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    UINT cp = CP_UTF8;
+    DWORD flags = MB_ERR_INVALID_CHARS;
+    int n = MultiByteToWideChar(cp, flags, s.c_str(), (int) s.size(), nullptr, 0);
+    if (n <= 0) {
+        cp = CP_ACP;
+        flags = 0;
+        n = MultiByteToWideChar(cp, flags, s.c_str(), (int) s.size(), nullptr, 0);
+    }
+    if (n <= 0) return std::wstring();
+    std::wstring w((size_t) n, L'\0');
+    MultiByteToWideChar(cp, flags, s.c_str(), (int) s.size(), &w[0], n);
+    return w;
+}
+#endif
+
+/// `std::filesystem::exists` on a narrow string uses the ANSI codepage on Windows, so a UTF-8 path (which is what
+/// a config file gives us) silently tests the wrong file.  One wrapper, both platforms.
+bool path_exists(const std::string& p) {
+#if defined(_WIN32)
+    return std::filesystem::exists(utf8_or_ansi_to_wide(p));
+#else
+    return std::filesystem::exists(p);
+#endif
+}
 bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     close();
     if (n_layers <= 0 || n_expert <= 0) { err = "FileExpertSource: the geometry is empty"; return false; }
@@ -409,7 +451,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         }
     }
     const std::string path = pack_dir + "/experts.bin";
-    if (layout.native && !gguf_.empty() && !std::filesystem::exists(path)) {
+    if (layout.native && !gguf_.empty() && !path_exists(path)) {
         // CS-T: no experts.bin - the model's GGUF shards, read in place
         blobs_ = (int64_t) blob_count;
         n_layers_ = n_layers;
@@ -423,9 +465,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 #if defined(_WIN32)
     // UTF-8 -> UTF-16: the pack may live under a path with non-ASCII characters, and `CreateFileA` would
     // silently mangle it into a file-not-found.
-    const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    std::vector<wchar_t> wpath((size_t) (wide > 0 ? wide : 1));
-    if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wide);
+    std::wstring wpath = utf8_or_ansi_to_wide(path);
     // **`FILE_FLAG_RANDOM_ACCESS` WAS HERE AND IT COST 14x.**
     //
     // The design depends on the OS page cache holding the whole 34 GB expert set, because this machine has
@@ -639,9 +679,7 @@ bool FileExpertSource::open_gguf(std::string& err) {
             if (it == index.end()) {
                 Map m;
 #if defined(_WIN32)
-                const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-                std::vector<wchar_t> wpath((size_t) (wide > 0 ? wide : 1));
-                if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wide);
+                std::wstring wpath = utf8_or_ansi_to_wide(path);
                 HANDLE f = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                        FILE_ATTRIBUTE_NORMAL, nullptr);
                 LARGE_INTEGER sz{};
@@ -929,9 +967,7 @@ uint64_t FileExpertSource::expert_bytes() const {
 bool FileExpertSource::open_direct(std::string& why) {
 #if defined(_WIN32)
     for (const std::string& path : paths_) {
-        const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-        std::vector<wchar_t> w((size_t) (wide > 0 ? wide : 1), L'\0');
-        if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w.data(), wide);
+        std::wstring w = utf8_or_ansi_to_wide(path);
         HANDLE h = CreateFileW(w.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
         if (h == INVALID_HANDLE_VALUE) {
@@ -2571,9 +2607,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
                     const std::string name = expert_gguf_file(gguf, lay, l, r);
                     if (name != open_name) {
                         if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-                        const int wide = MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, nullptr, 0);
-                        std::vector<wchar_t> w((size_t) std::max(wide, 1), L'\0');
-                        if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, w.data(), wide);
+                        std::wstring w = utf8_or_ansi_to_wide(name);
                         h = CreateFileW(w.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                         FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
                         if (h == INVALID_HANDLE_VALUE) {

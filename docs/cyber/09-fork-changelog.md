@@ -85,6 +85,36 @@
 
 ---
 
+### 1.4 serve 的前缀复用：极短段崩溃 + 三处"死得没留话" + 钉住量自动收 + 路径编码
+
+**起因**：内测回执报告 `--serve` 一开 `--prompt-cache` 就段错误（`0xC0000005`，stderr 一行都没有），
+而同一台机器、同一份参数的 CLI 完全正常；另一份报告说"每一轮对话都从 token 0 重读整个提示"。
+
+| 文件 | 位置 | 改了什么 | 为什么 | 怎么验证的 |
+|---|---|---|---|---|
+| `src/program/generate.cpp` | serve 的 prompt 切分循环 | 段长 < 256 的段**不再当独立段读**（不重新借槽、不走 `windows_ok` 的窗路径），借槽取引擎自己的最小分块 256 | 检查点只能在"读停止处"存，所以在最后一个 `<|im_start|>` 切开，切出来的尾段只有 **4 个 token**；这种段走窗路径会崩（见下） | 本机 1:1 复现（旧引擎退出码 322122477… 见 §7 出处）后修复：同一提示连发两次都不崩，且第二次 `12497 reused + 96 read` |
+| 同上 | 切分前 | 新增自证行 `strata serve: prompt split read_from=… root_at=… turn_at=… n=…` | 崩溃现场原来只能反推切分点 | 该行给出 `turn_at=5117 n=5122` ⇒ 尾段 4 token，与"卡在 19,100 of 19,105"的内测读数同源 |
+| 同上 | 看门狗 | `fflush(stderr)` **提到** `stall_report`/`release_gpu_waits` **之前** | 原顺序是 `fprintf → stall_report → release_gpu_waits → fflush → abort`，在 `release_gpu_waits` 里出事就**一行日志都不落** ⇒ 症状是"静默 45–78 s + 裸 0xC0000005" | 未触发（本机没跑出 60 s 卡住）；改动本身零行为变化 |
+| 同上 | 专家缓存定尺 | `cudaMemGetInfo` **检查返回码**；失败即报"取不到空闲显存"并退出 | 原来忽略返回码 ⇒ 打印 `0.00 GiB free … -> 0 slots`，随后死在一次 8 KB 的分配上，没人知道真因 | 见 §1.4 未验表（本机探针不失败） |
+| 同上 | 8 KB 分配失败 | 打 `cudaGetErrorString` + 当时空闲显存（先取局部变量，**不能**把两个有副作用的调用写在同一参数表里） | 原消息只有一句 `the embedding buffer failed` | 同上 |
+| 同上 | 专家银行的钉住上限 | `pin_limit = min(请求值, 可用内存 − 余量)`（余量 = 现有 `resident_headroom`，默认 8 GiB） | 全钉 18.32 GiB 在 31 GB 内存的机器上会把宿主机钉干；内测实测 **12 GiB 可用、14 GiB 就崩** | 规则在该机算出 ~12 GiB；本机 96 GB 不触发 |
+| `src/program/generate.cpp` | `--help` | 补 `--vram-reserve-mib`（含 `slots = (free − N) / blob` 口径）与"`--pool-workers` 超过物理核无收益" | 这个唯一的按卡旋钮不在 help 里 | `--help` exit 0，两行都在 |
+| `src/core/expert_source.cpp` / `.hpp` | 4 处模型文件打开 | 新增 `utf8_or_ansi_to_wide()`（**先 UTF-8、`MB_ERR_INVALID_CHARS` 失败再回退 ANSI**）与 `path_exists()`，替换原 `MultiByteToWideChar(CP_UTF8, …)` 与 `std::filesystem::exists(narrow)` | Windows 的 `argv` 是 ANSI，而这里按 UTF-8 转宽字符 ⇒ 中文路径变乱码 ⇒ `FileExpertSource: cannot open …`；而 **arena 那条路用窄字符（ANSI）打开所以没事** —— 正是内测看到的"两条路不一致" | **未验**（要中文目录下跑 `--mmap-experts`）|
+
+**前缀复用的实测（A 级，本机 4080 SUPER，一次只跑一个引擎、两臂在同样的显存状态下）**：
+
+| 轮次（DSH 形态：每轮重发整段历史） | 无 `--prompt-cache` | 有 `--prompt-cache 4` |
+|---|---|---|
+| 1（12,502 token） | `0 reused + 12502 read in 3193 ms` | `0 reused + 12502 read in 3304 ms` |
+| 2（12,593） | `0 reused + 12593 read in 3109 ms` | **`12497 reused + 96 read in 296 ms`** |
+| 3（12,684） | `0 reused + 12684 read in 3142 ms` | **`12588 reused + 96 read in 299 ms`** |
+| 每轮 wall | 3.26–3.37 s | **0.45 s** |
+
+⇒ 读取 ~**10.5×**、每轮 wall ~**7×**（省下的量正比于历史长度）。默认不开（`--prompt-cache 0`），
+引擎自己会说明代价：*"a batch split is not numerically neutral, so serve can then answer differently
+from the CLI on the same request"*。
+
+---
 ## §2 MTP（多 token 预测）
 
 | 文件 | 位置 | 改了什么 | 为什么 | 怎么验证的 |
